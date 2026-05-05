@@ -5,7 +5,11 @@ import os
 
 app = FastAPI()
 
-model = WhisperModel("small", device="cpu", compute_type="int8")
+model = WhisperModel(
+    "large-v3",
+    device="cpu",
+    compute_type="int8"
+)
 
 @app.post("/transcribe")
 async def transcribe(file: UploadFile = File(...)):
@@ -18,11 +22,15 @@ async def transcribe(file: UploadFile = File(...)):
     try:
         segments, info = model.transcribe(
             temp_path,
-            language="vi"
+            language="vi",
+            beam_size=5
         )
 
         text = " ".join([segment.text for segment in segments])
-        return {"text": text}
+        return {
+            "text": text,
+            "language": info.language
+        }
 
     finally:
         os.remove(temp_path)
