@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Realtime STT - Raw PCM Mode</title>
+</head>
+<body>
+    <button id="start">Start</button>
+    <button id="stop">Stop</button>
+    <h3>Transcript:</h3>
+    <div id="output" style="border: 1px solid #ccc; padding: 10px; min-height: 100px;"></div>
+
+    <script>
+        let ws;
+        let audioContext;
+        let processor;
+        let input;
+
+        document.getElementById("start").onclick = async () => {
+            document.getElementById("output").innerHTML = "";
+            ws = new WebSocket("ws://127.0.0.1:8000/ws/transcribe");
+
+            ws.onopen = async () => {
+                console.log("Connected to server");
+
+                // Khởi tạo AudioContext
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: 16000 // Khớp với samplerate của server
+                });
+
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                input = audioContext.createMediaStreamSource(stream);
+                
+                // Tạo processor để lấy dữ liệu thô (2048 samples mỗi lần)
+                processor = audioContext.createScriptProcessor(2048, 1, 1);
+
+                processor.onaudioprocess = (e) => {
+                    if (ws.readyState === WebSocket.OPEN) {
+                        const rawData = e.inputBuffer.getChannelData(0);
+                        // Gửi mảng Float32 thô lên server
+                        ws.send(rawData.buffer);
+                    }
+                };
+
+                input.connect(processor);
+                processor.connect(audioContext.destination);
+            };
+
+            ws.onmessage = (event) => {
+                document.getElementById("output").innerHTML += event.data + " ";
+            };
+        };
+
+        document.getElementById("stop").onclick = () => {
+            if (processor) processor.disconnect();
+            if (input) input.disconnect();
+            if (audioContext) audioContext.close();
+            if (ws) ws.close();
+            console.log("Stopped");
+        };
+    </script>
+</body>
+</html>
