@@ -4,6 +4,7 @@ import queue
 import threading
 import numpy as np
 import asyncio
+import noisereduce as nr
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from faster_whisper import WhisperModel
 
@@ -73,6 +74,12 @@ def transcriber_loop():
             audio_data = np.concatenate(audio_buffer)[:frames_per_chunk]
             overlap_frames = int(samplerate * 0.5)
             audio_buffer = [audio_data[-overlap_frames:]]
+
+            # --- NOISE REDUCTION ---
+            try:
+                audio_data = nr.reduce_noise(y=audio_data, sr=samplerate, stationary=True)
+            except Exception as nr_e:
+                print(f"Noise reduction error: {nr_e}")
 
             try:
                 segments, _ = model.transcribe(
