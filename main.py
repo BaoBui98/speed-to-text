@@ -1,111 +1,152 @@
 import os
 import sys
-import queue
-import threading
 import numpy as np
-import asyncio
-import noisereduce as nr
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from faster_whisper import WhisperModel
+from fastapi import FastAPI, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import ErrorFrame, Frame, InputAudioRawFrame, TranscriptionFrame
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.pipeline.task import PipelineTask
+from pipecat.processors.audio.vad_processor import VADProcessor
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.serializers.base_serializer import FrameSerializer
+from pipecat.services.whisper.stt import Model, WhisperSTTService
+from pipecat.transcriptions.language import Language
+from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 
-# --- FIX LỖI DLL GPU ---
 def fix_gpu_dlls():
-    if os.name == "nt":
-        nvidia_dir = os.path.join(sys.prefix, "Lib", "site-packages", "nvidia")
-        if os.path.exists(nvidia_dir):
-            for root, dirs, files in os.walk(nvidia_dir):
-                if "bin" in dirs:
-                    bin_path = os.path.abspath(os.path.join(root, "bin"))
-                    try: os.add_dll_directory(bin_path)
-                    except: pass
-                    os.environ["PATH"] = bin_path + os.pathsep + os.environ["PATH"]
+    """Make NVIDIA wheel DLLs discoverable on Windows before CUDA initializes."""
+    if os.name != "nt":
+        return
+
+    nvidia_dir = os.path.join(sys.prefix, "Lib", "site-packages", "nvidia")
+    if not os.path.exists(nvidia_dir):
+        return
+
+    for root, dirs, _files in os.walk(nvidia_dir):
+        if "bin" in dirs:
+            bin_path = os.path.abspath(os.path.join(root, "bin"))
+            try:
+                os.add_dll_directory(bin_path)
+            except OSError:
+                pass
+            os.environ["PATH"] = bin_path + os.pathsep + os.environ["PATH"]
 
 fix_gpu_dlls()
 
-# --- SETTINGS ---
-samplerate = 16000
-chunk_duration = 2
-frames_per_chunk = int(samplerate * chunk_duration)
-audio_queue = queue.Queue()
-
-# --- INIT MODEL ---
-def init_model():
-    try:
-        # Thử test GPU thực tế
-        m = WhisperModel("large-v3", device="cuda", compute_type="float16")
-        list(m.transcribe(np.zeros(16000, dtype=np.float32)))
-        return m, "🚀 GPU MODE (CUDA - float16)"
-    except:
-        return WhisperModel("small", device="cpu", compute_type="int8"), "🐌 CPU FALLBACK (int8)"
-
-model, device_info = init_model()
-print(f"INITIALIZED: {device_info}")
+SAMPLE_RATE = 16000
+CHANNELS = 1
+GARBAGE_PHRASES = ("cảm ơn", "hẹn gặp lại", "subscribe", "đăng ký", "video tiếp theo")
 
 app = FastAPI()
 
-# --- WEBSOCKET ---
+# Thêm CORS để tránh lỗi kết nối từ các port khác nhau
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# KHỞI TẠO MODEL LARGE_V3_TURBO NGAY TẠI ĐÂY (Startup)
+# Bước này sẽ tải model về máy trong lần chạy đầu tiên.
+print("--- ĐANG KHỞI TẠO MODEL LARGE_V3_TURBO (Vui lòng đợi cho đến khi tải xong) ---")
+stt_service = WhisperSTTService(
+    device="auto",
+    compute_type="default",
+    settings=WhisperSTTService.Settings(
+        model=Model.LARGE_V3_TURBO.value,
+        language=Language.VI,
+        no_speech_prob=0.6,
+    )
+)
+vad_analyzer = SileroVADAnalyzer()
+
+class BrowserFloat32PCMSerializer(FrameSerializer):
+    """Deserialize raw Float32 browser audio into Pipecat's 16-bit PCM frames."""
+
+    def __init__(self, sample_rate: int = SAMPLE_RATE, num_channels: int = CHANNELS):
+        super().__init__()
+        self._sample_rate = sample_rate
+        self._num_channels = num_channels
+
+    async def serialize(self, frame: Frame) -> str | bytes | None:
+        return None
+
+    async def deserialize(self, data: str | bytes) -> Frame | None:
+        if not isinstance(data, bytes):
+            return None
+
+        audio = np.frombuffer(data, dtype=np.float32).copy()
+        if audio.size == 0:
+            return None
+
+        audio = np.nan_to_num(audio, copy=False)
+        pcm16 = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
+        return InputAudioRawFrame(
+            audio=pcm16.tobytes(),
+            sample_rate=self._sample_rate,
+            num_channels=self._num_channels,
+        )
+
+
+class WebSocketTranscriptionSender(FrameProcessor):
+    def __init__(self, websocket: WebSocket):
+        super().__init__()
+        self._websocket = websocket
+        self._last_text = ""
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TranscriptionFrame):
+            text = frame.text.strip()
+            is_garbage = any(phrase in text.lower() for phrase in GARBAGE_PHRASES)
+
+            if text and not is_garbage and text != self._last_text:
+                print(f"STT: {text}")
+                await self._websocket.send_text(text)
+                self._last_text = text
+
+        elif isinstance(frame, ErrorFrame):
+            print(f"Pipecat error: {frame.error}")
+            await self._websocket.send_text(f"[error] {frame.error}")
+
+        await self.push_frame(frame, direction)
+
+
 @app.websocket("/ws/transcribe")
 async def transcribe_ws(websocket: WebSocket):
     await websocket.accept()
-    # Thông báo cho bạn biết đang dùng gì ngay khi connect
-    print(f"New client connected. Using: {device_info}")
-    app.current_ws = websocket 
-    try:
-        while True:
-            data = await websocket.receive_bytes()
-            chunk = np.frombuffer(data, dtype=np.float32)
-            audio_queue.put(chunk)
-    except WebSocketDisconnect:
-        app.current_ws = None
 
-# --- TRANSCRIBER ---
-def transcriber_loop():
-    audio_buffer = []
-    last_text = ""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    transport = FastAPIWebsocketTransport(
+        websocket=websocket,
+        params=FastAPIWebsocketParams(
+            audio_in_enabled=True,
+            audio_in_sample_rate=SAMPLE_RATE,
+            audio_in_channels=CHANNELS,
+            serializer=BrowserFloat32PCMSerializer(),
+            session_timeout=None,
+        ),
+    )
+    
+    # Sử dụng các model đã được khởi tạo sẵn ở trên
+    vad = VADProcessor(vad_analyzer=vad_analyzer)
+    sender = WebSocketTranscriptionSender(websocket)
 
-    while True:
-        block = audio_queue.get()
-        audio_buffer.append(block)
-        total_frames = sum(len(b) for b in audio_buffer)
+    pipeline = Pipeline([transport.input(), vad, stt_service, sender])
+    task = PipelineTask(pipeline)
 
-        if total_frames >= frames_per_chunk:
-            audio_data = np.concatenate(audio_buffer)[:frames_per_chunk]
-            overlap_frames = int(samplerate * 0.5)
-            audio_buffer = [audio_data[-overlap_frames:]]
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(_transport, _websocket):
+        print("New Pipecat STT client connected")
 
-            # --- NOISE REDUCTION ---
-            try:
-                audio_data = nr.reduce_noise(y=audio_data, sr=samplerate, stationary=True)
-            except Exception as nr_e:
-                print(f"Noise reduction error: {nr_e}")
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(_transport, _websocket):
+        print("Pipecat STT client disconnected")
+        await task.cancel()
 
-            try:
-                segments, _ = model.transcribe(
-                    audio_data.flatten().astype(np.float32),
-                    language="vi",
-                    beam_size=1,
-                    vad_filter=True,
-                    condition_on_previous_text=False, # Chống ảo tưởng
-                    no_speech_threshold=0.6,          # Chống ảo tưởng
-                    initial_prompt="Tôi đang nói chuyện bình thường."
-                )
-
-                for segment in segments:
-                    text = segment.text.strip()
-                    # Lọc bỏ các câu chào hỏi YouTube mặc định của Whisper
-                    garbage_phrases = ["cảm ơn", "hẹn gặp lại", "subscribe", "đăng ký", "video tiếp theo"]
-                    is_garbage = any(phrase in text.lower() for phrase in garbage_phrases)
-
-                    if text and not is_garbage and text != last_text:
-                        print(f"🗨️ {text}")
-                        if hasattr(app, 'current_ws') and app.current_ws:
-                            try:
-                                loop.run_until_complete(app.current_ws.send_text(text))
-                            except: pass
-                        last_text = text
-            except Exception as e:
-                print(f"Error: {e}")
-
-threading.Thread(target=transcriber_loop, daemon=True).start()
+    runner = PipelineRunner(handle_sigint=False)
+    await runner.run(task)

@@ -1,7 +1,7 @@
-faster-whisper
-sounddevice
+fastapi
+uvicorn[standard]
+pipecat-ai[websocket,whisper]
 numpy
 torch
 nvidia-cublas-cu12
 nvidia-cudnn-cu12
-noisereduce

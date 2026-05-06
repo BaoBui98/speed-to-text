@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Realtime STT - Raw PCM Mode</title>
+    <title>Realtime STT - Pipecat</title>
 </head>
 <body>
     <button id="start">Start</button>
@@ -14,8 +14,24 @@
         let audioContext;
         let processor;
         let input;
+        let mediaStream;
+
+        const stopAudio = () => {
+            if (processor) processor.disconnect();
+            if (input) input.disconnect();
+            if (audioContext) audioContext.close();
+            if (mediaStream) mediaStream.getTracks().forEach((track) => track.stop());
+            if (ws) ws.close();
+
+            processor = null;
+            input = null;
+            audioContext = null;
+            mediaStream = null;
+            ws = null;
+        };
 
         document.getElementById("start").onclick = async () => {
+            stopAudio();
             document.getElementById("output").innerHTML = "";
             ws = new WebSocket("ws://127.0.0.1:8000/ws/transcribe");
 
@@ -27,8 +43,8 @@
                     sampleRate: 16000 // Khớp với samplerate của server
                 });
 
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                input = audioContext.createMediaStreamSource(stream);
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                input = audioContext.createMediaStreamSource(mediaStream);
                 
                 // Tạo processor để lấy dữ liệu thô (2048 samples mỗi lần)
                 processor = audioContext.createScriptProcessor(2048, 1, 1);
@@ -48,13 +64,18 @@
             ws.onmessage = (event) => {
                 document.getElementById("output").innerHTML += event.data + " ";
             };
+
+            ws.onerror = () => {
+                console.error("WebSocket error");
+            };
+
+            ws.onclose = () => {
+                console.log("WebSocket closed");
+            };
         };
 
         document.getElementById("stop").onclick = () => {
-            if (processor) processor.disconnect();
-            if (input) input.disconnect();
-            if (audioContext) audioContext.close();
-            if (ws) ws.close();
+            stopAudio();
             console.log("Stopped");
         };
     </script>
