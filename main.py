@@ -1,8 +1,8 @@
 import os
 import sys
-
 import numpy as np
 from fastapi import FastAPI, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import ErrorFrame, Frame, InputAudioRawFrame, TranscriptionFrame
 from pipecat.pipeline.pipeline import Pipeline
@@ -41,6 +41,28 @@ GARBAGE_PHRASES = ("cảm ơn", "hẹn gặp lại", "subscribe", "đăng ký", 
 
 app = FastAPI()
 
+# Thêm CORS để tránh lỗi kết nối từ các port khác nhau
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# KHỞI TẠO MODEL LARGE_V3_TURBO NGAY TẠI ĐÂY (Startup)
+# Bước này sẽ tải model về máy trong lần chạy đầu tiên.
+print("--- ĐANG KHỞI TẠO MODEL LARGE_V3_TURBO (Vui lòng đợi cho đến khi tải xong) ---")
+stt_service = WhisperSTTService(
+    device="auto",
+    compute_type="default",
+    settings=WhisperSTTService.Settings(
+        model=Model.LARGE_V3_TURBO.value,
+        language=Language.VI,
+        no_speech_prob=0.6,
+    )
+)
+vad_analyzer = SileroVADAnalyzer()
 
 class BrowserFloat32PCMSerializer(FrameSerializer):
     """Deserialize raw Float32 browser audio into Pipecat's 16-bit PCM frames."""
@@ -109,17 +131,12 @@ async def transcribe_ws(websocket: WebSocket):
             session_timeout=None,
         ),
     )
-    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer())
-    stt = WhisperSTTService(
-        model=Model.LARGE_V3_TURBO,
-        device="auto",
-        compute_type="default",
-        language=Language.VI,
-        no_speech_prob=0.6,
-    )
+    
+    # Sử dụng các model đã được khởi tạo sẵn ở trên
+    vad = VADProcessor(vad_analyzer=vad_analyzer)
     sender = WebSocketTranscriptionSender(websocket)
 
-    pipeline = Pipeline([transport.input(), vad, stt, sender])
+    pipeline = Pipeline([transport.input(), vad, stt_service, sender])
     task = PipelineTask(pipeline)
 
     @transport.event_handler("on_client_connected")
