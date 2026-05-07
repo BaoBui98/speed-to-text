@@ -4,6 +4,7 @@ import numpy as np
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import ErrorFrame, Frame, InputAudioRawFrame, TranscriptionFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -50,19 +51,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# KHỞI TẠO MODEL LARGE_V3_TURBO NGAY TẠI ĐÂY (Startup)
-# Bước này sẽ tải model về máy trong lần chạy đầu tiên.
-print("--- ĐANG KHỞI TẠO MODEL LARGE_V3_TURBO (Vui lòng đợi cho đến khi tải xong) ---")
-stt_service = WhisperSTTService(
-    device="auto",
-    compute_type="default",
-    settings=WhisperSTTService.Settings(
-        model=Model.LARGE_V3_TURBO.value,
-        language=Language.VI,
-        no_speech_prob=0.6,
-    )
+from faster_whisper import WhisperModel
+
+# KHỞI TẠO MODEL LARGE_V3_TURBO TOÀN CỤC (Chỉ tải 1 lần duy nhất lúc khởi động server)
+print("--- ĐANG KHỞI TẠO MODEL LARGE_V3_TURBO TOÀN CỤC (Vui lòng đợi) ---")
+GLOBAL_WHISPER_MODEL = WhisperModel(
+    Model.LARGE_V3_TURBO.value,
+    device="cuda",
+    compute_type="float16",
+    # language="vi"
 )
-vad_analyzer = SileroVADAnalyzer()
+print("--- ĐÃ TẢI XONG MODEL LARGE_V3_TURBO VÀO BỘ NHỚ ---")
+
+class ReusableWhisperSTTService(WhisperSTTService):
+    def _load(self):
+        # Tái sử dụng model đã tải sẵn toàn cục, tránh khởi tạo lại nhiều lần gây tốn tài nguyên và chậm kết nối
+        self._model = GLOBAL_WHISPER_MODEL
+
+    async def run_stt(self, audio: bytes):
+        # Lọc các đoạn âm thanh quá ngắn (dưới 0.3 giây tương đương 9600 bytes ở 16kHz 16-bit PCM)
+        # để tránh gây lỗi đổ vỡ (crash) thư viện CTranslate2 của faster-whisper.
+        if len(audio) < 9600:
+            print(f"Bỏ qua phân đoạn âm thanh quá ngắn ({len(audio)} bytes) để bảo vệ hệ thống.")
+            return
+
+        try:
+            async for frame in super().run_stt(audio):
+                yield frame
+        except Exception as e:
+            print(f"Lỗi khi nhận diện giọng nói: {e}")
 
 class BrowserFloat32PCMSerializer(FrameSerializer):
     """Deserialize raw Float32 browser audio into Pipecat's 16-bit PCM frames."""
@@ -132,11 +149,31 @@ async def transcribe_ws(websocket: WebSocket):
         ),
     )
     
-    # Sử dụng các model đã được khởi tạo sẵn ở trên
-    vad = VADProcessor(vad_analyzer=vad_analyzer)
+    # Khởi tạo VAD analyzer riêng biệt cho kết nối này để tránh lỗi trạng thái khi ngắt kết nối
+    local_vad_analyzer = SileroVADAnalyzer(
+        params=VADParams(
+            confidence=0.45,      # Độ nhạy phát hiện giọng nói (mặc định 0.5, giảm nhẹ để nhận diện từ ngắn dễ hơn)
+            start_secs=0.12,      # Nói siêu ngắn (0.12s) cũng bắt đầu bắt giọng để tránh mất chữ đầu câu
+            stop_secs=1.0,        # Đợi 1.0 giây im lặng mới dừng nói, giúp câu nói ngắn không bị cắt cụt quá sớm
+            min_volume=0.02,      # Nhạy bén hơn với các từ nói nhỏ
+        )
+    )
+    vad = VADProcessor(vad_analyzer=local_vad_analyzer)
+    
+    # Khởi tạo STT service riêng biệt bằng cách tái sử dụng mô hình WhisperModel đã được tải toàn cục
+    local_stt_service = ReusableWhisperSTTService(
+        settings=ReusableWhisperSTTService.Settings(
+            model=Model.LARGE_V3_TURBO.value,
+            language=Language.VI,
+            no_speech_prob=0.4,  # Nghiêm ngặt hơn để lọc tạp âm/im lặng tốt hơn
+        ),
+        device="cuda",
+        compute_type="float16",
+    )
+    
     sender = WebSocketTranscriptionSender(websocket)
 
-    pipeline = Pipeline([transport.input(), vad, stt_service, sender])
+    pipeline = Pipeline([transport.input(), vad, local_stt_service, sender])
     task = PipelineTask(pipeline)
 
     @transport.event_handler("on_client_connected")
