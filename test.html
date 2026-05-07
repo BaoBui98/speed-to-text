@@ -15,6 +15,8 @@
         let processor;
         let input;
         let mediaStream;
+        const SAMPLE_RATE = 16000;
+        const STREAM_CHUNK_SIZE = 1024; // 64ms/chunk, đủ nhỏ để VAD phản hồi nhanh.
 
         const stopAudio = () => {
             if (processor) processor.disconnect();
@@ -40,20 +42,20 @@
 
                 // Khởi tạo AudioContext
                 audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                    sampleRate: 16000 // Khớp với samplerate của server
+                    sampleRate: SAMPLE_RATE // Khớp với samplerate của server
                 });
 
                 mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
                 input = audioContext.createMediaStreamSource(mediaStream);
                 
-                // Tạo processor để lấy dữ liệu thô (2048 samples mỗi lần)
-                processor = audioContext.createScriptProcessor(2048, 1, 1);
+                // Tạo processor để gửi small streaming chunks đều đặn lên server.
+                processor = audioContext.createScriptProcessor(STREAM_CHUNK_SIZE, 1, 1);
 
                 processor.onaudioprocess = (e) => {
                     if (ws.readyState === WebSocket.OPEN) {
                         const rawData = e.inputBuffer.getChannelData(0);
-                        // Gửi mảng Float32 thô lên server
-                        ws.send(rawData.buffer);
+                        // Copy buffer để mỗi WebSocket message là một chunk độc lập.
+                        ws.send(rawData.slice().buffer);
                     }
                 };
 
