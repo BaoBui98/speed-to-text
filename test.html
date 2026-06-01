@@ -1,85 +1,137 @@
 <!DOCTYPE html>
-<html>
+<html lang="vi">
+
 <head>
-    <title>Realtime STT - Pipecat</title>
+    <meta charset="UTF-8">
+    <title>Realtime STT - Pipecat Optimized</title>
+    <style>
+        body {
+            font-family: system-ui, sans-serif;
+            max-width: 600px;
+            margin: 40px auto;
+            padding: 0 20px;
+        }
+
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+
+        #output {
+            border: 1px solid #ccc;
+            padding: 15px;
+            min-height: 150px;
+            background: #fafafa;
+            margin-top: 20px;
+            white-space: pre-wrap;
+            line-height: 1.6;
+        }
+    </style>
 </head>
+
 <body>
-    <button id="start">Start</button>
-    <button id="stop">Stop</button>
-    <h3>Transcript:</h3>
-    <div id="output" style="border: 1px solid #ccc; padding: 10px; min-height: 100px;"></div>
+    <h2>Realtime Speech-to-Text (PhoWhisper)</h2>
+    <button id="start">Bắt đầu ghi âm</button>
+    <button id="stop" disabled>Dừng</button>
+    <h3>Kết quả dịch:</h3>
+    <div id="output"></div>
 
     <script>
         let ws;
         let audioContext;
-        let processor;
-        let input;
         let mediaStream;
+        let audioWorkletNode;
         const SAMPLE_RATE = 16000;
-        const STREAM_CHUNK_SIZE = 1024; // 64ms/chunk, đủ nhỏ để VAD phản hồi nhanh.
+
+        // Định nghĩa mã nguồn AudioWorklet xử lý luồng âm thanh dưới dạng inline Blob
+        const workletCode = `
+            class AudioProcessor extends AudioWorkletProcessor {
+                process(inputs, outputs, parameters) {
+                    const input = inputs[0];
+                    if (input && input[0]) {
+                        // Lấy dữ liệu kênh Mono đầu tiên truyền thẳng về Main Thread
+                        this.port.postMessage(input[0]);
+                    }
+                    return true;
+                }
+            }
+            registerProcessor('audio-processor', AudioProcessor);
+        `;
+        const workletUrl = URL.createObjectURL(new Blob([workletCode], { type: 'application/javascript' }));
 
         const stopAudio = () => {
-            if (processor) processor.disconnect();
-            if (input) input.disconnect();
-            if (audioContext) audioContext.close();
-            if (mediaStream) mediaStream.getTracks().forEach((track) => track.stop());
+            if (audioWorkletNode) audioWorkletNode.disconnect();
+            if (audioContext && audioContext.state !== 'closed') audioContext.close();
+            if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
             if (ws) ws.close();
 
-            processor = null;
-            input = null;
+            audioWorkletNode = null;
             audioContext = null;
             mediaStream = null;
             ws = null;
+
+            document.getElementById("start").disabled = false;
+            document.getElementById("stop").disabled = true;
         };
 
         document.getElementById("start").onclick = async () => {
-            stopAudio();
+            document.getElementById("start").disabled = true;
+            document.getElementById("stop").disabled = false;
             document.getElementById("output").innerHTML = "";
+
             ws = new WebSocket("ws://127.0.0.1:8000/ws/transcribe");
 
             ws.onopen = async () => {
-                console.log("Connected to server");
+                console.log("Đã kết nối máy chủ STT");
 
-                // Khởi tạo AudioContext
                 audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                    sampleRate: SAMPLE_RATE // Khớp với samplerate của server
+                    sampleRate: SAMPLE_RATE
                 });
 
-                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                input = audioContext.createMediaStreamSource(mediaStream);
-                
-                // Tạo processor để gửi small streaming chunks đều đặn lên server.
-                processor = audioContext.createScriptProcessor(STREAM_CHUNK_SIZE, 1, 1);
+                // Đăng ký luồng xử lý AudioWorklet vào AudioContext
+                await audioContext.audioWorklet.addModule(workletUrl);
 
-                processor.onaudioprocess = (e) => {
-                    if (ws.readyState === WebSocket.OPEN) {
-                        const rawData = e.inputBuffer.getChannelData(0);
-                        // Copy buffer để mỗi WebSocket message là một chunk độc lập.
-                        ws.send(rawData.slice().buffer);
+                // Bật các bộ lọc phần cứng từ trình duyệt để tăng chất lượng giọng nói đầu vào
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
+
+                const source = audioContext.createMediaStreamSource(mediaStream);
+                audioWorkletNode = new AudioWorkletNode(audioContext, 'audio-processor');
+
+                // Lắng nghe mảng Float32 tuần tự từ Worker gửi về và chuyển tiếp qua WebSocket
+                audioWorkletNode.port.onmessage = (event) => {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        const float32Array = event.data;
+                        ws.send(float32Array.buffer);
                     }
                 };
 
-                input.connect(processor);
-                processor.connect(audioContext.destination);
+                source.connect(audioWorkletNode);
+                audioWorkletNode.connect(audioContext.destination);
             };
 
             ws.onmessage = (event) => {
-                document.getElementById("output").innerHTML += event.data + " ";
+                document.getElementById("output").innerHTML += event.data + "\n";
             };
 
-            ws.onerror = () => {
-                console.error("WebSocket error");
-            };
-
+            ws.onerror = (e) => console.error("Lỗi WebSocket:", e);
             ws.onclose = () => {
-                console.log("WebSocket closed");
+                console.log("Đã đóng kết nối máy chủ");
+                stopAudio();
             };
         };
 
         document.getElementById("stop").onclick = () => {
             stopAudio();
-            console.log("Stopped");
         };
     </script>
 </body>
+
 </html>
